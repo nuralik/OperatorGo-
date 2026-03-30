@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from models.deeponet import DeepONetGo
 from training.self_play import play_game
+from mcts.batched_search import play_games_batched
 
 
 # ── Parallel worker ───────────────────────────────────────────────────────────
@@ -215,13 +216,16 @@ def main():
         'mps'  if torch.backends.mps.is_available() else
         'cpu'
     )
-    n_workers = min(args.workers, 8)
+    n_workers   = min(args.workers, 8)
+    use_batched = device == 'cuda'   # batched GPU eval only worthwhile on CUDA
 
     print(f"Device     : {device}")
+    print(f"Mode       : {'batched GPU eval' if use_batched else 'parallel CPU workers'}")
     print(f"Simulations: {args.simulations} per move")
     print(f"Games/iter : {args.games_per_iter}")
     print(f"Train steps: {args.train_steps}")
-    print(f"Workers    : {n_workers} parallel games")
+    if not use_batched:
+        print(f"Workers    : {n_workers} parallel games")
 
     model = DeepONetGo(
         board_size=args.board_size,
@@ -273,28 +277,39 @@ def main():
         t0 = time.time()
         wins = draws = losses = 0
 
-        # ── Write weights to shared file for workers ──────────────────────
-        os.makedirs('checkpoints', exist_ok=True)
-        torch.save(model.cpu().state_dict(), WORKER_WEIGHTS_PATH)
-        model.to(device)
-
-        # ── Self-play phase — non-blocking so Ctrl+C is responsive ────────
+        # ── Self-play phase ───────────────────────────────────────────────
         model.eval()
-        with mp.Pool(processes=n_workers) as pool:
-            async_result = pool.map_async(_play_game_worker,
-                                          [worker_arg] * args.games_per_iter)
-            while not async_result.ready():
+
+        if use_batched:
+            # GPU batched: all games run as threads, evals batched on GPU
+            results = play_games_batched(
+                model, device,
+                n_games=args.games_per_iter,
+                board_size=args.board_size,
+                n_simulations=args.simulations,
+                max_batch_size=args.games_per_iter * 2,
+            )
+        else:
+            # CPU fallback: multiprocessing pool
+            os.makedirs('checkpoints', exist_ok=True)
+            torch.save(model.cpu().state_dict(), WORKER_WEIGHTS_PATH)
+            model.to(device)
+
+            with mp.Pool(processes=n_workers) as pool:
+                async_result = pool.map_async(_play_game_worker,
+                                              [worker_arg] * args.games_per_iter)
+                while not async_result.ready():
+                    if stop_requested:
+                        pool.terminate()
+                        break
+                    async_result.wait(timeout=2.0)
+
                 if stop_requested:
-                    pool.terminate()
+                    print(f"\nSaved checkpoint at iteration {iteration - 1}.")
+                    print("Resume with: python -m training.self_play_train --resume")
                     break
-                async_result.wait(timeout=2.0)
 
-            if stop_requested:
-                print(f"\nSaved checkpoint at iteration {iteration - 1}.")
-                print("Resume with: python -m training.self_play_train --resume")
-                break
-
-            results = async_result.get()
+                results = async_result.get()
 
         for samples in results:
             buffer.add(samples)
