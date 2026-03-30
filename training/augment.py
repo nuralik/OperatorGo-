@@ -79,6 +79,9 @@ def augment_dataset(
     Input  shape: (N, 3, size, size)
     Output shape: (8N, 3, size, size)
     """
+    if boards.ndim < 3 or len(boards) == 0:
+        raise ValueError(f"augment_dataset received empty or malformed boards array: shape={boards.shape}. "
+                         f"Check that SGF data exists and was loaded correctly.")
     size = boards.shape[2]
     out_boards, out_policies, out_values = [], [], []
 
